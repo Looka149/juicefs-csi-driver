@@ -542,13 +542,18 @@ func (p *PodMount) createOrAddRef(ctx context.Context, podName string, jfsSettin
 					log.Info("mount pod cannot be smoothly upgraded. do not serve the FUSE fd.", "podName", podName)
 				}
 
-				_, err = p.K8sClient.CreatePod(ctx, newPod)
+				createdPod, err := p.K8sClient.CreatePod(ctx, newPod)
 				if err != nil {
 					log.Error(err, "Create pod err, stop fuse fd server", "podName", podName)
 					if supportFusePass {
 						passfd.GlobalFds.StopFd(ctx, newPod)
 					}
 					return false, err
+				}
+				for _, dropped := range jfsSetting.DroppedOptions {
+					if err := p.K8sClient.CreateEvent(ctx, *createdPod, corev1.EventTypeWarning, "MountOptionDropped", dropped); err != nil {
+						log.Error(err, "create event error", "podName", podName)
+					}
 				}
 				return true, nil
 			} else if k8serrors.IsTimeout(err) {

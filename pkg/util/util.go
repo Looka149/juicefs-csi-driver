@@ -513,6 +513,8 @@ func ParseToBytes(value string) (uint64, error) {
 	}
 	var shift int
 	switch unit {
+	// the mount binary accepts a bare byte suffix, keep the two parsers in sync
+	case 'B':
 	case 'k', 'K':
 		shift = 10
 	case 'm', 'M':

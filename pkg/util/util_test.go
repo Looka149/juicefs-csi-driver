@@ -632,6 +632,11 @@ func TestParseToBytes(t *testing.T) {
 			want: 1 << 30,
 		},
 		{
+			name: "test-has-byte-uint",
+			args: "1048576B",
+			want: 1 << 20,
+		},
+		{
 			name:    "test-invalid",
 			args:    "1d",
 			wantErr: true,

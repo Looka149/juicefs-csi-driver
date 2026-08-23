@@ -47,8 +47,10 @@ const (
 )
 
 type JfsSetting struct {
-	HashVal        string         `json:"-"`
-	UpgradeUUID    string         `json:"-"`
+	HashVal     string `json:"-"`
+	UpgradeUUID string `json:"-"`
+	// options dropped while building the mount pod, surfaced as events on it
+	DroppedOptions []string       `json:"-"`
 	JuiceFSSecret  *corev1.Secret `json:"-"`
 	CustomerSecret *corev1.Secret `json:"-"`
 	IsCe           bool
@@ -1156,22 +1158,32 @@ func getDefaultResource() corev1.ResourceRequirements {
 	}
 }
 
-func processOption(option string, resources corev1.ResourceRequirements) string {
+// processOption returns the option to keep, or an empty string to drop it. The
+// second value explains a drop that the user should know about.
+func processOption(option string, resources corev1.ResourceRequirements, finalPass bool) (string, string) {
 	pair := strings.Split(option, "=")
-	if len(pair) != 2 || pair[0] != "buffer-size" {
-		return option
+	if len(pair) != 2 || strings.TrimSpace(pair[0]) != "buffer-size" {
+		return option, ""
 	}
+	pair[0], pair[1] = strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
 	memLimit := resources.Limits[corev1.ResourceMemory]
 	memLimitByte := memLimit.Value()
 	if memLimitByte <= 0 {
-		return option
+		// sidecar resources are only settled in the final pass, so a percentage may
+		// still be waiting for the limit it is calculated from
+		if finalPass && strings.HasSuffix(pair[1], "%") {
+			msg := fmt.Sprintf("dropped mount option buffer-size=%s: a percentage needs a memory limit on the mount pod, JuiceFS falls back to its default", pair[1])
+			log.Info(msg)
+			return "", msg
+		}
+		return option, ""
 	}
 
 	if strings.HasSuffix(strings.TrimSpace(pair[1]), "%") {
 		percentage, err := util.ParsePercentageToFloat(pair[1])
 		if err != nil {
 			log.Error(err, "parse buffer-size error, ignore buffer-size option", "buffer-size", pair[1])
-			return ""
+			return "", ""
 		}
 		const mib = int64(1024 * 1024)
 		if percentage > 100 {
@@ -1180,13 +1192,13 @@ func processOption(option string, resources corev1.ResourceRequirements) string 
 		}
 		bufferSize := int64(math.Ceil(float64(memLimitByte) * percentage / 100))
 		pair[1] = strconv.FormatInt((bufferSize+mib-1)/mib, 10)
-		return strings.Join(pair, "=")
+		return strings.Join(pair, "="), ""
 	}
 
 	bufferSize, err := util.ParseToBytes(pair[1])
 	if err != nil {
 		log.Error(err, "parse buffer-size error, ignore buffer-size option", "buffer-size", pair[1])
-		return ""
+		return "", ""
 	}
 
 	if bufferSize > uint64(memLimitByte) {
@@ -1195,7 +1207,7 @@ func processOption(option string, resources corev1.ResourceRequirements) string 
 		option = strings.Join(pair, "=")
 	}
 
-	return option
+	return option, ""
 }
 
 func getAppContainerResources(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) corev1.ResourceRequirements {
@@ -1366,15 +1378,21 @@ func applyConfigPatch(setting *JfsSetting, replaceTemplate bool) {
 	for _, option := range patch.MountOptions {
 		pair := strings.Split(option, "=")
 		patchOptionsMap[pair[0]] = true
-		if v := processOption(option, setting.Attr.Resources); v != "" {
+		v, dropped := processOption(option, setting.Attr.Resources, replaceTemplate)
+		if v != "" {
 			newOptions = append(newOptions, v)
+		} else if dropped != "" {
+			setting.DroppedOptions = append(setting.DroppedOptions, dropped)
 		}
 	}
 	for _, option := range setting.Options {
 		pair := strings.Split(option, "=")
 		if _, ok := patchOptionsMap[pair[0]]; !ok {
-			if v := processOption(option, setting.Attr.Resources); v != "" {
+			v, dropped := processOption(option, setting.Attr.Resources, replaceTemplate)
+			if v != "" {
 				newOptions = append(newOptions, v)
+			} else if dropped != "" {
+				setting.DroppedOptions = append(setting.DroppedOptions, dropped)
 			}
 		}
 	}
