@@ -64,6 +64,10 @@ func (api *API) putCSIConfig() gin.HandlerFunc {
 			c.JSON(400, gin.H{"error": err.Error()})
 			return
 		}
+		if err := cfg.Validate(); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 
 		_, err := api.client.CoreV1().ConfigMaps(api.sysNamespace).Update(c, &cm, metav1.UpdateOptions{})
 		if err != nil {
@@ -109,6 +113,15 @@ func (api *API) getCSIConfigDiff() gin.HandlerFunc {
 		if err != nil {
 			c.String(500, "get upgrade pods error %v", err)
 			return
+		}
+		// skip pods which are already in running upgrade tasks
+		pods, skippedPods, err := config.FilterPodsNotInOngoingUpgrade(c, api.client, pods)
+		if err != nil {
+			c.String(500, "filter running upgrade pods error %v", err)
+			return
+		}
+		if len(skippedPods) > 0 {
+			batchLog.Info("Skip pods already in ongoing upgrade jobs", "pods", skippedPods)
 		}
 		_, podDiffs, err := api.genPodDiffs(c, pods, true)
 		if err != nil {

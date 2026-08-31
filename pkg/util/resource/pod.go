@@ -427,12 +427,12 @@ func GetPVWithVolumeHandleOrAppInfo(ctx context.Context, client *k8s.K8sClient, 
 	return pv, pvc, nil
 }
 
-func GetCommPath(basePath string, pod corev1.Pod) (string, error) {
+func GetCommPath(basePath string, pod corev1.Pod, pid int) (string, error) {
 	upgradeUUID := GetUpgradeUUID(&pod)
 	if upgradeUUID == "" {
 		return "", fmt.Errorf("pod %s/%s has no hash label", pod.Namespace, pod.Name)
 	}
-	return path.Join(basePath, upgradeUUID, "fuse_fd_comm.1"), nil
+	return path.Join(basePath, upgradeUUID, fmt.Sprintf("fuse_fd_comm.%d", pid)), nil
 }
 
 func GetUniqueId(pod corev1.Pod) string {
@@ -567,6 +567,7 @@ func FilterVars[T any](vars []T, excludeName string, getName func(T) string) []T
 	return filteredVars
 }
 
+// used by kubectl plugin
 func FilterPodsToUpgrade(podLists corev1.PodList, recreate bool) []corev1.Pod {
 	var pods = []corev1.Pod{}
 	for _, pod := range podLists.Items {

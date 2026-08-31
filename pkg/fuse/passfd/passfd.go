@@ -122,13 +122,14 @@ func (fs *Fds) ParseFuseFds(ctx context.Context) {
 			continue
 		}
 		var subEntries []os.DirEntry
+		parentPath := path.Join(fs.basePath, entry.Name())
 		err = util.DoWithTimeout(ctx, 2*time.Second, func(ctx context.Context) error {
-			subEntries, err = os.ReadDir(path.Join(fs.basePath, entry.Name()))
+			subEntries, err = os.ReadDir(parentPath)
 			return err
 		})
 		if err != nil {
-			fdLog.Error(err, "read dir error", "basePath", fs.basePath)
-			return
+			fdLog.Error(err, "read dir error", "basePath", fs.basePath, "path", parentPath)
+			continue
 		}
 		shouldRemove := true
 		for _, subEntry := range subEntries {
@@ -140,15 +141,15 @@ func (fs *Fds) ParseFuseFds(ctx context.Context) {
 					continue
 				}
 				fdLog.V(1).Info("parse fuse fd", "path", subdir)
+				limitCh <- struct{}{}
 				wg.Add(1)
-				go func() {
+				go func(upgradeUUID, fusePath string) {
 					defer func() {
-						wg.Done()
 						<-limitCh
+						wg.Done()
 					}()
-					limitCh <- struct{}{}
-					fs.parseFuse(ctx, entry.Name(), subdir)
-				}()
+					fs.parseFuse(ctx, upgradeUUID, fusePath)
+				}(entry.Name(), subdir)
 			}
 		}
 		if shouldRemove {
@@ -297,6 +298,7 @@ type fd struct {
 	fuseFd      int
 	fuseSetting []byte
 	sid         uint64
+	statePath   string
 
 	serverAddress      string // server for pod
 	serverAddressInPod string // server path in pod
@@ -393,6 +395,14 @@ func (fs *Fds) handleFDRequest(upgradeUUID string, conn *net.UnixConn) {
 	}
 
 	fs.globalMu.Lock()
+	if fs.fds[upgradeUUID] != f {
+		fs.globalMu.Unlock()
+		for _, fd := range fds {
+			_ = syscall.Close(fd)
+		}
+		fdLog.V(1).Info("drop stale FUSE fd", "upgradeUUID", upgradeUUID, "fd", fds)
+		return
+	}
 	if string(msg) != "CLOSE" && f.fuseFd <= 0 && len(fds) >= 1 {
 		f.fuseFd = fds[0]
 		f.fuseSetting = msg
@@ -436,6 +446,37 @@ func (fs *Fds) GetSid(pod *corev1.Pod) uint64 {
 	sid := f.sid
 	fs.globalMu.Unlock()
 	return sid
+}
+
+func (fs *Fds) UpdateStatePath(pod *corev1.Pod, statePath string) {
+	if fs == nil {
+		return
+	}
+	upgradeUUID := resource.GetUpgradeUUID(pod)
+	fs.globalMu.Lock()
+	f := fs.fds[upgradeUUID]
+	if f == nil {
+		fs.globalMu.Unlock()
+		return
+	}
+	f.statePath = statePath
+	fs.fds[upgradeUUID] = f
+	fs.globalMu.Unlock()
+}
+
+func (fs *Fds) GetStatePath(pod *corev1.Pod) string {
+	if fs == nil {
+		return ""
+	}
+	fs.globalMu.Lock()
+	f := fs.fds[resource.GetUpgradeUUID(pod)]
+	if f == nil {
+		fs.globalMu.Unlock()
+		return ""
+	}
+	statePath := f.statePath
+	fs.globalMu.Unlock()
+	return statePath
 }
 
 func GetFuseFd(path string, close bool) (int, []byte) {
@@ -508,7 +549,7 @@ func getFd(via *net.UnixConn, num int) ([]byte, []int, error) {
 	// recvmsg
 	msg := make([]byte, syscall.CmsgSpace(100))
 	oob := make([]byte, syscall.CmsgSpace(num*4))
-	n, oobn, _, _, err := syscall.Recvmsg(socket, msg, oob, 0)
+	n, oobn, _, _, err := syscall.Recvmsg(socket, msg, oob, msgCmsgCloexec)
 	if err != nil {
 		return nil, nil, err
 	}

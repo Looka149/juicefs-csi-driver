@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/klog/v2"
 
@@ -107,6 +108,7 @@ var CSISetEnvMap = map[string]interface{}{
 	"JUICEFS_CLIENT_PATH":               nil,
 	"JUICEFS_CLIENT_SIDERCAR_CONTAINER": nil,
 	"JFS_NO_CHECK_OBJECT_STORAGE":       nil,
+	common.JfsStatePathEnv:              nil,
 }
 
 // opts auto set by the csi side
@@ -157,6 +159,28 @@ func GetPodLock(podHashVal string) *sync.Mutex {
 	h.Write([]byte(podHashVal))
 	index := h.Sum32() % 1024
 	return &PodLocks[index]
+}
+
+func LockPod(ctx context.Context, podHashVal string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	lock := GetPodLock(podHashVal)
+	if lock.TryLock() {
+		return lock.Unlock, nil
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			if lock.TryLock() {
+				return lock.Unlock, nil
+			}
+		}
+	}
 }
 
 func MustGetWebPort() int {
@@ -212,6 +236,14 @@ type MountPatchCacheDir struct {
 	AccessModes      []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
 }
 
+type ResourcePercentages struct {
+	Limits    ResourcePercentageList `json:"limits,omitempty"`
+	Requests  ResourcePercentageList `json:"requests,omitempty"`
+	MinLimits corev1.ResourceList    `json:"minLimits,omitempty"`
+}
+
+type ResourcePercentageList map[corev1.ResourceName]string
+
 type MountPodPatch struct {
 	// used to specify the selector for the PVC that will be patched
 	// omit will patch for all PVC
@@ -225,6 +257,7 @@ type MountPodPatch struct {
 	CacheDirs    []MountPatchCacheDir `json:"cacheDirs,omitempty"`
 
 	Image                         string                       `json:"-"`
+	ImagePullPolicy               corev1.PullPolicy            `json:"imagePullPolicy,omitempty"`
 	Labels                        map[string]string            `json:"labels,omitempty"`
 	Annotations                   map[string]string            `json:"annotations,omitempty"`
 	HostNetwork                   *bool                        `json:"hostNetwork,omitempty" `
@@ -237,6 +270,7 @@ type MountPodPatch struct {
 	StartupProbe                  *corev1.Probe                `json:"startupProbe,omitempty"`
 	Lifecycle                     *corev1.Lifecycle            `json:"lifecycle,omitempty"`
 	Resources                     *corev1.ResourceRequirements `json:"resources,omitempty"`
+	ResourcePercentages           *ResourcePercentages         `json:"resourcePercentages,omitempty"`
 	TerminationGracePeriodSeconds *int64                       `json:"terminationGracePeriodSeconds,omitempty"`
 	Volumes                       []corev1.Volume              `json:"volumes,omitempty"`
 	VolumeDevices                 []corev1.VolumeDevice        `json:"volumeDevices,omitempty"`
@@ -300,6 +334,9 @@ func (mpp *MountPodPatch) merge(mp MountPodPatch) {
 	if mp.EEMountImage != "" {
 		mpp.EEMountImage = mp.EEMountImage
 	}
+	if mp.ImagePullPolicy != "" {
+		mpp.ImagePullPolicy = mp.ImagePullPolicy
+	}
 	if mp.HostNetwork != nil {
 		mpp.HostNetwork = mp.HostNetwork
 	}
@@ -332,6 +369,9 @@ func (mpp *MountPodPatch) merge(mp MountPodPatch) {
 	}
 	if mp.Resources != nil {
 		mpp.Resources = mp.Resources
+	}
+	if mp.ResourcePercentages != nil {
+		mpp.ResourcePercentages = mp.ResourcePercentages
 	}
 	if mp.TerminationGracePeriodSeconds != nil {
 		mpp.TerminationGracePeriodSeconds = mp.TerminationGracePeriodSeconds
@@ -419,6 +459,8 @@ type Config struct {
 	EnableAutoRemoveRequestResources *bool `json:"enableAutoRemoveRequestResources,omitempty"`
 	// enable auto abort stuck mount pod after timeout, the default is true
 	EnableAutoAbortStuckMountPod *bool `json:"enableAutoAbortStuckMountPod,omitempty"`
+	// enable lazy umount target, the default is true
+	EnableLazyUmountTarget *bool `json:"enableLazyUmountTarget,omitempty"`
 	// use kubelet API to list mount pods on the node
 	// if enabled, the driver will try to use kubelet API to list mount pods on the node, and fall back to request api-server if kubelet API fails
 	// Kubelet synchronization of pods may have delays, which in high-concurrency scenarios could lead to mountpods not being reused.
@@ -428,6 +470,84 @@ type Config struct {
 
 func (c *Config) Unmarshal(data []byte) error {
 	return yaml.Unmarshal(data, c)
+}
+
+// Validate checks the config for invalid fields such as env var names,
+// label/annotation keys and label values that would cause pod creation to fail.
+//
+// NOTE: This method mirrors the frontend validateConfigData() in
+// dashboard-ui-v2/src/pages/config-detail.tsx. When changing validation rules
+// here, update the frontend validators and vice versa.
+func (c *Config) Validate() error {
+	for i, patch := range c.MountPodPatch {
+		for _, env := range patch.Env {
+			if errs := validation.IsRelaxedEnvVarName(env.Name); len(errs) > 0 {
+				return fmt.Errorf("mountPodPatch[%d].env: invalid environment variable name %q: %s", i, env.Name, strings.Join(errs, "; "))
+			}
+		}
+		for k, v := range patch.Labels {
+			if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+				return fmt.Errorf("mountPodPatch[%d].labels: invalid key %q: %s", i, k, strings.Join(errs, "; "))
+			}
+			if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+				return fmt.Errorf("mountPodPatch[%d].labels: invalid value %q for key %q: %s", i, v, k, strings.Join(errs, "; "))
+			}
+		}
+		for k := range patch.Annotations {
+			if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+				return fmt.Errorf("mountPodPatch[%d].annotations: invalid key %q: %s", i, k, strings.Join(errs, "; "))
+			}
+		}
+		volumeNames := make(map[string]bool, len(patch.Volumes))
+		usedVolumes := make(map[string]bool, len(patch.VolumeMounts)+len(patch.VolumeDevices))
+		for _, volume := range patch.Volumes {
+			volumeNames[volume.Name] = true
+		}
+		for j, volumeMount := range patch.VolumeMounts {
+			if !volumeNames[volumeMount.Name] {
+				return fmt.Errorf("mountPodPatch[%d].volumeMounts[%d]: volume %q not found in volumes", i, j, volumeMount.Name)
+			}
+			usedVolumes[volumeMount.Name] = true
+		}
+		for j, volumeDevice := range patch.VolumeDevices {
+			if !volumeNames[volumeDevice.Name] {
+				return fmt.Errorf("mountPodPatch[%d].volumeDevices[%d]: volume %q not found in volumes", i, j, volumeDevice.Name)
+			}
+			usedVolumes[volumeDevice.Name] = true
+		}
+		for j, volume := range patch.Volumes {
+			if !usedVolumes[volume.Name] {
+				return fmt.Errorf("mountPodPatch[%d].volumes[%d]: volume %q not found in volumeMounts or volumeDevices", i, j, volume.Name)
+			}
+		}
+		// Note: resource.Quantity fields are already validated during Unmarshal()
+		// via resource.Quantity.UnmarshalJSON; no redundant check needed here.
+		for j, cd := range patch.CacheDirs {
+			switch cd.Type {
+			case MountPatchCacheDirTypeHostPath:
+				if cd.Path == "" {
+					return fmt.Errorf("mountPodPatch[%d].cacheDirs[%d]: path is required for HostPath type", i, j)
+				}
+			case MountPatchCacheDirTypePVC:
+				if cd.Name == "" {
+					return fmt.Errorf("mountPodPatch[%d].cacheDirs[%d]: name is required for PVC type", i, j)
+				}
+			case MountPatchCacheDirTypeEmptyDir, MountPatchCacheDirTypeEphemeral:
+				// no required fields
+			default:
+				return fmt.Errorf("mountPodPatch[%d].cacheDirs[%d]: invalid type %q, must be one of HostPath, PVC, EmptyDir, Ephemeral", i, j, cd.Type)
+			}
+		}
+		if patch.DNSPolicy != "" {
+			switch patch.DNSPolicy {
+			case corev1.DNSClusterFirst, corev1.DNSClusterFirstWithHostNet, corev1.DNSDefault, corev1.DNSNone:
+				// valid
+			default:
+				return fmt.Errorf("mountPodPatch[%d].dnsPolicy: invalid value %q, must be one of ClusterFirst, ClusterFirstWithHostNet, Default, None", i, patch.DNSPolicy)
+			}
+		}
+	}
+	return nil
 }
 
 // GenMountPodPatch generate mount pod patch from jfsSetting

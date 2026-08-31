@@ -45,6 +45,8 @@ import (
 
 var batchLog = klog.NewKlogr().WithName("batch")
 
+const batchUpgradeTimeoutEnv = "BATCH_UPGRADE_TIMEOUT_SECONDS"
+
 type ListJobResult struct {
 	Total    int           `json:"total"`
 	Continue string        `json:"continue"`
@@ -74,6 +76,10 @@ func (api *API) createUpgradeJob() gin.HandlerFunc {
 			c.String(400, "smooth upgrade is disabled")
 			return
 		}
+		if err := validateBatchUpgradeTimeoutEnv(); err != nil {
+			c.String(500, err.Error())
+			return
+		}
 		createJobBody := struct {
 			JobName     string `json:"jobName,omitempty"`
 			NodeName    string `json:"nodeName,omitempty"`
@@ -96,6 +102,15 @@ func (api *API) createUpgradeJob() gin.HandlerFunc {
 		if err != nil {
 			c.String(500, "get upgrade pods error %v", err)
 			return
+		}
+		// skip pods which are already in running upgrade tasks
+		pods, skippedPods, err := config.FilterPodsNotInOngoingUpgrade(c, api.client, pods)
+		if err != nil {
+			c.String(500, "filter running upgrade pods error %v", err)
+			return
+		}
+		if len(skippedPods) > 0 {
+			batchLog.Info("Skip pods already in ongoing upgrade jobs", "pods", skippedPods)
 		}
 		// skip pods which have no diff config
 		pods, _, err = api.genPodDiffs(c, pods, true)
@@ -151,7 +166,7 @@ func (api *API) listUpgradeJobs() gin.HandlerFunc {
 			return
 		}
 
-		configs, err := api.getAllUpgradeConfig(c)
+		configs, err := config.GetAllUpgradeConfigs(c, api.client)
 		if err != nil {
 			c.String(500, "get all upgrade config error %v", err)
 			return
@@ -412,6 +427,13 @@ func NewUpgradeJob(jobName string) *batchv1.Job {
 		sa = os.Getenv("JUICEFS_CSI_DASHBOARD_SA")
 	}
 	configName := GenUpgradeConfig(jobName)
+	envs := []corev1.EnvVar{
+		{Name: "SYS_NAMESPACE", Value: sysNamespace},
+		{Name: common.JfsUpgradeConfig, Value: configName},
+	}
+	if timeout, ok := os.LookupEnv(batchUpgradeTimeoutEnv); ok {
+		envs = append(envs, corev1.EnvVar{Name: batchUpgradeTimeoutEnv, Value: timeout})
+	}
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -440,10 +462,7 @@ func NewUpgradeJob(jobName string) *batchv1.Job {
 						Name:    "juicefs-upgrade",
 						Image:   strings.TrimSpace(os.Getenv("DASHBOARD_IMAGE")),
 						Command: cmds,
-						Env: []corev1.EnvVar{
-							{Name: "SYS_NAMESPACE", Value: sysNamespace},
-							{Name: common.JfsUpgradeConfig, Value: configName},
-						},
+						Env:     envs,
 					}},
 					RestartPolicy:      corev1.RestartPolicyNever,
 					ServiceAccountName: sa,
@@ -451,6 +470,17 @@ func NewUpgradeJob(jobName string) *batchv1.Job {
 			},
 		},
 	}
+}
+
+func validateBatchUpgradeTimeoutEnv() error {
+	timeout, ok := os.LookupEnv(batchUpgradeTimeoutEnv)
+	if !ok || timeout == "" {
+		return nil
+	}
+	if _, err := strconv.ParseInt(timeout, 10, 64); err != nil {
+		return fmt.Errorf("%s must be an integer number of seconds", batchUpgradeTimeoutEnv)
+	}
+	return nil
 }
 
 type PodDiff struct {
@@ -509,6 +539,7 @@ func (api *API) genPodDiffs(ctx context.Context, mountPods []corev1.Pod, shouldD
 	return GenPodDiffs(mountPods, shouldDiff, pvs, pvcs, secrets, nodeMap)
 }
 
+// used in kubectl plugin
 func GenPodDiffs(mountPods []corev1.Pod, shouldDiff bool, pvs []corev1.PersistentVolume, pvcs []corev1.PersistentVolumeClaim, secrets []corev1.Secret, nodeMap map[string]*corev1.Node) ([]corev1.Pod, []PodDiff, error) {
 	pvMap := make(map[string]*corev1.PersistentVolume)
 	pvcMap := make(map[string]*corev1.PersistentVolumeClaim)
@@ -568,31 +599,6 @@ func GenUpgradeJobName() string {
 
 func GenUpgradeConfig(jobName string) string {
 	return fmt.Sprintf("%s-config", jobName)
-}
-
-func (api *API) getAllUpgradeConfig(ctx context.Context) (map[string]*config.BatchConfig, error) {
-	var (
-		cmList  *corev1.ConfigMapList
-		configs = make(map[string]*config.BatchConfig)
-		err     error
-	)
-	s, _ := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
-		MatchLabels: map[string]string{
-			common.PodTypeKey: common.ConfigTypeValue,
-		},
-	})
-	cmList, err = api.client.CoreV1().ConfigMaps(config.Namespace).List(ctx, metav1.ListOptions{LabelSelector: s.String()})
-	if err != nil {
-		return nil, err
-	}
-	for _, cm := range cmList.Items {
-		cfg, err := config.LoadBatchConfig(&cm)
-		if err != nil {
-			return nil, err
-		}
-		configs[cm.Name] = cfg
-	}
-	return configs, nil
 }
 
 func (api *API) getPodOfUpgradeJob(c context.Context, job *batchv1.Job) (*corev1.Pod, error) {

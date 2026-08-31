@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -30,7 +32,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/mount"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -130,13 +131,32 @@ func (p *PodDriver) SetMountInfo(mit mountInfoTable) {
 	p.mit = mit
 }
 
-func (p *PodDriver) Run(ctx context.Context, current *corev1.Pod) (Result, error) {
-	if current == nil {
+func (p *PodDriver) Run(ctx context.Context, pod *corev1.Pod) (Result, error) {
+	if pod == nil {
 		return Result{}, nil
 	}
-	log := klog.NewKlogr().WithName("pod-driver").WithValues("podName", current.Name)
+	log := klog.NewKlogr().WithName("pod-driver").WithValues("podName", pod.Name)
 	ctxWithLog := util.WithLog(ctx, log)
+	// resourceVersion of kubelet may be different from apiserver
+	// so we need get latest pod resourceVersion from apiserver
+	current, err := p.Client.GetPod(ctxWithLog, pod.Name, pod.Namespace)
+	if err != nil {
+		return Result{}, ctrlclient.IgnoreNotFound(err)
+	}
+	oldPs := getPodStatus(pod)
 	ps := getPodStatus(current)
+	if oldPs != ps {
+		if uniqueId, ok := current.Labels[common.PodUniqueIdLabelKey]; ok {
+			upgradeUUID := resource.GetUpgradeUUID(current)
+			p.lock.Lock()
+			for i := range p.uniqueIdIndex[uniqueId] {
+				if p.uniqueIdIndex[uniqueId][i].upgradeUUID == upgradeUUID {
+					p.uniqueIdIndex[uniqueId][i].status = ps
+				}
+			}
+			p.lock.Unlock()
+		}
+	}
 	log.V(1).Info("start handle pod", "namespace", current.Namespace, "status", ps)
 
 	// check refs in mount pod annotation first, delete ref that target pod is not found
@@ -152,17 +172,11 @@ func (p *PodDriver) Run(ctx context.Context, current *corev1.Pod) (Result, error
 		return p.handlers[ps](ctxWithLog, current)
 	}
 
-	// resourceVersion of kubelet may be different from apiserver
-	// so we need get latest pod resourceVersion from apiserver
-	pod, err := p.Client.GetPod(ctxWithLog, current.Name, current.Namespace)
-	if err != nil {
-		return Result{}, ctrlclient.IgnoreNotFound(err)
-	}
 	// set mount pod status in mit again, maybe deleted
 	p.lock.Lock()
-	p.mit.setPodStatus(pod)
+	p.mit.setPodStatus(current)
 	p.lock.Unlock()
-	return p.handlers[getPodStatus(pod)](ctxWithLog, pod)
+	return p.handlers[getPodStatus(current)](ctxWithLog, current)
 }
 
 // getPodStatus get pod status
@@ -191,9 +205,11 @@ func getPodStatus(pod *corev1.Pod) podStatus {
 func (p *PodDriver) checkAnnotations(ctx context.Context, pod *corev1.Pod) (Result, error) {
 	log := util.GenLog(ctx, podDriverLog, "")
 	// check refs in mount pod, the corresponding pod exists or not
-	lock := config.GetPodLock(config.GetPodLockKey(pod, ""))
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := config.LockPod(ctx, config.GetPodLockKey(pod, ""))
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
 
 	delAnnotations := []string{}
 	var existTargets int
@@ -201,11 +217,19 @@ func (p *PodDriver) checkAnnotations(ctx context.Context, pod *corev1.Pod) (Resu
 		if k == util.GetReferenceKey(target) {
 			targetUid := getPodUid(target)
 			// Only it is not in pod lists can be seen as deleted
+			p.lock.Lock()
 			_, exists := p.mit.deletedPods[targetUid]
+			p.lock.Unlock()
 			if !exists {
+				if acquired := resource.SharedVolumeLocks.TryAcquire(target); !acquired {
+					log.Info("target path operation is in progress, skip deleting annotation", "target", target)
+					existTargets++
+					continue
+				}
 				// target pod is deleted
 				log.Info("get app pod deleted in annotations of mount pod, remove its ref.", "appId", targetUid)
 				delAnnotations = append(delAnnotations, k)
+				resource.SharedVolumeLocks.Release(target)
 				continue
 			}
 			existTargets++
@@ -216,17 +240,6 @@ func (p *PodDriver) checkAnnotations(ctx context.Context, pod *corev1.Pod) (Resu
 		delAnnotations = append(delAnnotations, common.DeleteDelayAtKey)
 	}
 	if len(delAnnotations) != 0 {
-		// check mount pod reference key, if it is not the latest, return conflict
-		newPod, err := p.Client.GetPod(ctx, pod.Name, pod.Namespace)
-		if err != nil {
-			return Result{}, err
-		}
-		if len(resource.GetAllRefKeys(*newPod)) != len(resource.GetAllRefKeys(*pod)) {
-			return Result{}, apierrors.NewConflict(schema.GroupResource{
-				Group:    pod.GroupVersionKind().Group,
-				Resource: pod.GroupVersionKind().Kind,
-			}, pod.Name, fmt.Errorf("can not patch pod"))
-		}
 		if err := resource.DelPodAnnotation(ctx, p.Client, pod.Name, pod.Namespace, delAnnotations); err != nil {
 			return Result{}, err
 		}
@@ -238,23 +251,14 @@ func (p *PodDriver) checkAnnotations(ctx context.Context, pod *corev1.Pod) (Resu
 			return Result{}, err
 		}
 		if !shouldDelay {
-			// check mount pod resourceVersion, if it is not the latest, return conflict
-			newPod, err := p.Client.GetPod(ctx, pod.Name, pod.Namespace)
-			if err != nil {
-				return Result{}, err
-			}
-			// check mount pod reference key, if it is not none, return conflict
-			if len(resource.GetAllRefKeys(*newPod)) != 0 {
-				return Result{}, apierrors.NewConflict(schema.GroupResource{
-					Group:    pod.GroupVersionKind().Group,
-					Resource: pod.GroupVersionKind().Kind,
-				}, pod.Name, fmt.Errorf("can not delete pod"))
-			}
 			// close socket
-			if config.SupportFusePass(newPod) {
-				passfd.GlobalFds.StopFd(ctx, newPod)
+			sourcePath, _, err := util.GetMountPathOfPod(*pod)
+			if err == nil {
+				util.SaveFuseDevMinor(pod.Name, sourcePath)
 			}
-			sourcePath, _, err := util.GetMountPathOfPod(*newPod)
+			if config.SupportFusePass(pod) {
+				passfd.GlobalFds.StopFd(ctx, pod)
+			}
 			if err == nil {
 				_ = util.DoWithTimeout(ctx, defaultCheckoutTimeout, func(ctx context.Context) error {
 					return util.UmountPath(ctx, sourcePath, true)
@@ -293,9 +297,11 @@ func (p *PodDriver) podCompleteHandler(ctx context.Context, pod *corev1.Pod) (Re
 	}
 	hashVal := setting.HashVal
 
-	lock := config.GetPodLock(config.GetPodLockKey(pod, hashVal))
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := config.LockPod(ctx, config.GetPodLockKey(pod, hashVal))
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
 
 	hasAvailPod := p.getAvailableMountPod(pod.Labels[common.PodUniqueIdLabelKey], resource.GetUpgradeUUID(pod))
 	if !hasAvailPod {
@@ -305,20 +311,29 @@ func (p *PodDriver) podCompleteHandler(ctx context.Context, pod *corev1.Pod) (Re
 		if err != nil {
 			return Result{}, err
 		}
-		// get sid
+		// get sid and state path
 		sid := passfd.GlobalFds.GetSid(pod)
-		if sid != 0 {
+		statePath := passfd.GlobalFds.GetStatePath(pod)
+		if sid != 0 || statePath != "" {
 			env := []corev1.EnvVar{}
 			oldEnv := newPod.Spec.Containers[0].Env
 			for _, v := range oldEnv {
-				if v.Name != "_JFS_META_SID" {
+				if v.Name != "_JFS_META_SID" && v.Name != common.JfsStatePathEnv {
 					env = append(env, v)
 				}
 			}
-			env = append(env, corev1.EnvVar{
-				Name:  "_JFS_META_SID",
-				Value: fmt.Sprintf("%d", sid),
-			})
+			if sid != 0 {
+				env = append(env, corev1.EnvVar{
+					Name:  "_JFS_META_SID",
+					Value: fmt.Sprintf("%d", sid),
+				})
+			}
+			if statePath != "" {
+				env = append(env, corev1.EnvVar{
+					Name:  common.JfsStatePathEnv,
+					Value: statePath,
+				})
+			}
 			newPod.Spec.Containers[0].Env = env
 		}
 
@@ -342,9 +357,11 @@ func (p *PodDriver) podErrorHandler(ctx context.Context, pod *corev1.Pod) (Resul
 		return Result{}, nil
 	}
 	log := util.GenLog(ctx, podDriverLog, "podErrorHandler")
-	lock := config.GetPodLock(config.GetPodLockKey(pod, ""))
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := config.LockPod(ctx, config.GetPodLockKey(pod, ""))
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
 
 	// check resource err
 	if resource.IsPodResourceError(pod) {
@@ -452,9 +469,11 @@ func (p *PodDriver) podDeletedHandler(ctx context.Context, pod *corev1.Pod) (Res
 	}
 	hashVal := setting.HashVal
 
-	lock := config.GetPodLock(config.GetPodLockKey(pod, hashVal))
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := config.LockPod(ctx, config.GetPodLockKey(pod, hashVal))
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
 
 	for k, v := range pod.Annotations {
 		// annotation is checked in beginning, don't double-check here
@@ -480,7 +499,16 @@ func (p *PodDriver) podDeletedHandler(ctx context.Context, pod *corev1.Pod) (Res
 		// delete tmp file
 		log.Info("delete tmp state file because it is not smoothly upgrade")
 		_ = util.DoWithTimeout(ctx, defaultCheckoutTimeout, func(ctx context.Context) error {
-			return os.Remove(path.Join("/tmp", hashVal, "state1.json"))
+			stateFiles, err := filepath.Glob(path.Join("/tmp", resource.GetUpgradeUUID(pod), "state*.json"))
+			if err != nil {
+				return err
+			}
+			for _, stateFile := range stateFiles {
+				if err := os.Remove(stateFile); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 		newPod, err := p.newMountPod(ctx, pod, newPodName)
 		if err == nil {
@@ -548,9 +576,11 @@ func (p *PodDriver) podPendingHandler(ctx context.Context, pod *corev1.Pod) (Res
 		return Result{}, nil
 	}
 	log := util.GenLog(ctx, podDriverLog, "podPendingHandler")
-	lock := config.GetPodLock(config.GetPodLockKey(pod, ""))
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := config.LockPod(ctx, config.GetPodLockKey(pod, ""))
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
 
 	enableAutoRemove := config.GlobalConfig.EnableAutoRemoveRequestResources == nil || *config.GlobalConfig.EnableAutoRemoveRequestResources
 	// check resource err
@@ -634,9 +664,11 @@ func (p *PodDriver) podReadyHandler(ctx context.Context, pod *corev1.Pod) (Resul
 
 	supFusePass := config.SupportFusePass(pod)
 
-	lock := config.GetPodLock(config.GetPodLockKey(pod, ""))
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := config.LockPod(ctx, config.GetPodLockKey(pod, ""))
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
 
 	err = resource.WaitUntilMountReady(ctx, pod.Name, mntPath, defaultCheckoutTimeout)
 	if err != nil {
@@ -681,15 +713,19 @@ func (p *PodDriver) podReadyHandler(ctx context.Context, pod *corev1.Pod) (Resul
 
 func (p *PodDriver) recover(ctx context.Context, pod *corev1.Pod, mntPath string) error {
 	log := util.GenLog(ctx, podDriverLog, "recover")
-	if err := p.mit.parse(); err != nil {
+	mit := newMountInfoTable()
+	if err := mit.parse(); err != nil {
 		log.Error(err, "parse mount info error")
 		return err
 	}
+	p.lock.Lock()
+	maps.Copy(mit.deletedPods, p.mit.deletedPods)
+	p.lock.Unlock()
 	for k, target := range pod.Annotations {
 		if k == util.GetReferenceKey(target) {
 			var mi *mountItem
 			err := util.DoWithTimeout(ctx, defaultCheckoutTimeout, func(ctx context.Context) error {
-				mi = p.mit.resolveTarget(ctx, target)
+				mi = mit.resolveTarget(ctx, target)
 				return nil
 			})
 			if err != nil || mi == nil {
@@ -993,12 +1029,21 @@ func (p *PodDriver) checkMountPodStuck(pod *corev1.Pod) {
 		foundDev bool
 	)
 	if runtime.GOOS == "linux" {
-		devMinor, foundDev = util.GetFuseDevMinor(mountPoint)
+		devMinor, foundDev = util.GetSavedFuseDevMinor(pod.Name)
+		if !foundDev {
+			devMinor, foundDev = util.GetFuseDevMinor(mountPoint)
+		}
 	}
+	if !foundDev {
+		log.Info("can't find devMinor of mountPoint, maybe not fuse mount, skip checking", "mount point", mountPoint)
+		return
+	}
+
+	defer util.DeleteFuseDevMinor(pod.Name)
 
 	timeout := 1 * time.Minute
 	if pod.Spec.TerminationGracePeriodSeconds != nil {
-		gracePeriod := time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * 2
+		gracePeriod := time.Second * time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * 2
 		if gracePeriod > timeout {
 			timeout = gracePeriod
 		}
@@ -1011,12 +1056,8 @@ func (p *PodDriver) checkMountPodStuck(pod *corev1.Pod) {
 		case <-ctx.Done():
 			log.Info("mount pod may be stuck in terminating state, create a job to abort fuse connection")
 			if runtime.GOOS == "linux" {
-				if foundDev {
-					if err := p.DoAbortFuse(pod, devMinor); err != nil {
-						log.Error(err, "abort fuse connection error")
-					}
-				} else {
-					log.Info("can't find devMinor of mountPoint", "mount point", mountPoint)
+				if err := p.DoAbortFuse(pod, devMinor); err != nil {
+					log.Error(err, "abort fuse connection error")
 				}
 			}
 			return
@@ -1134,6 +1175,8 @@ func (p *PodDriver) recordPod(uniqueId, upgradeUUID string) {
 
 func (p *PodDriver) getUniqueMountPod(ctx context.Context, uniqueId string) bool {
 	// check pods in which get from kubelet
+	p.lock.Lock()
+	defer p.lock.Unlock()
 	for _, u := range p.uniqueIdIndex[uniqueId] {
 		if u.status != podDeleted && u.status != podComplete {
 			return true

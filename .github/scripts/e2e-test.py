@@ -47,6 +47,7 @@ from test_case import (
     test_dynamic_pvc_delete_not_last_with_path_pattern,
     test_webhook_two_volume,
     test_sidecar_config_with_node_selector,
+    test_sidecar_config_resource_percentages_with_node_selector,
     test_dynamic_expand,
     test_multi_pvc,
     test_mountpod_recreated,
@@ -55,6 +56,7 @@ from test_case import (
     test_recreate_mountpod_reload_config,
     test_secret_has_owner_reference,
     test_secret_has_owner_reference_shared_mount,
+    test_mount_secret_not_updated_when_reused,
     test_set_quota_in_controller,
     test_recreate_mountpod_with_template_config,
 )
@@ -93,6 +95,7 @@ if __name__ == "__main__":
                 test_multi_pvc()
                 test_mountpod_recreated()
                 test_secret_has_owner_reference()
+                test_mount_secret_not_updated_when_reused()
                 if without_kubelet:
                     test_pod_resource_err()
                 test_config()
@@ -123,6 +126,8 @@ if __name__ == "__main__":
                 test_quota_using_storage_rw()
                 test_dynamic_expand()
                 test_multi_pvc()
+                if test_mode == "pod-mount-share":
+                    test_mount_secret_not_updated_when_reused()
                 if without_kubelet:
                     test_pod_resource_err()
                 if test_mode == "pod-mount-share":
@@ -151,6 +156,7 @@ if __name__ == "__main__":
                 test_quota_using_storage_rw()
                 test_dynamic_expand()
                 test_multi_pvc()
+                test_mount_secret_not_updated_when_reused()
                 if without_kubelet:
                     test_pod_resource_err()
                 test_config()
@@ -172,6 +178,7 @@ if __name__ == "__main__":
                     test_job_complete_using_storage()
                     test_deployment_using_storage_rw()
                     test_sidecar_config_with_node_selector()
+                    test_sidecar_config_resource_percentages_with_node_selector()
                     test_dynamic_mount_image_with_webhook()
                     test_deployment_dynamic_patch_pv_with_webhook()
                     test_quota_using_storage_rw()
@@ -190,6 +197,7 @@ if __name__ == "__main__":
                     test_delete_pvc()
                     test_deployment_using_storage_rw()
                     test_sidecar_config_with_node_selector()
+                    test_sidecar_config_resource_percentages_with_node_selector()
                     test_deployment_dynamic_patch_pv_with_webhook()
                     test_dynamic_mount_image_with_webhook()
                     test_path_pattern_in_storage_class()

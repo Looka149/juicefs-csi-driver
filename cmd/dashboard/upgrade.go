@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,6 +47,10 @@ import (
 )
 
 var batchConfigName string
+
+const batchUpgradeTimeoutEnv = "BATCH_UPGRADE_TIMEOUT_SECONDS"
+const defaultPodUpgradeTimeout = 300 * time.Second
+const minPodUpgradeTimeout = 5 * time.Second
 
 var upgradeCmd = &cobra.Command{
 	Use:   "upgrade",
@@ -95,17 +100,18 @@ var upgradeCmd = &cobra.Command{
 			}
 		}
 		bu := &BatchUpgrade{
-			sysNamespace:    sysNamespace,
-			conf:            conf,
-			k8sConfig:       k8sconfig,
-			k8sClient:       k8sClient,
-			clientset:       clientset,
-			lock:            sync.Mutex{},
-			podsStatus:      podsStatus,
-			status:          config.Running,
-			crtBatchStatus:  config.Pending,
-			nextBatchStatus: config.Pending,
-			crtBatch:        0,
+			sysNamespace:      sysNamespace,
+			conf:              conf,
+			k8sConfig:         k8sconfig,
+			k8sClient:         k8sClient,
+			clientset:         clientset,
+			podUpgradeTimeout: defaultPodUpgradeTimeout,
+			lock:              sync.Mutex{},
+			podsStatus:        podsStatus,
+			status:            config.Running,
+			crtBatchStatus:    config.Pending,
+			nextBatchStatus:   config.Pending,
+			crtBatch:          0,
 		}
 		bu.flushStatus(context.TODO())
 		ctx, cancel := context.WithCancel(context.Background())
@@ -151,11 +157,12 @@ func (u *BatchUpgrade) handleSignal() {
 }
 
 type BatchUpgrade struct {
-	sysNamespace string
-	conf         *config.BatchConfig
-	k8sConfig    *rest.Config
-	k8sClient    *k8sclient.K8sClient
-	clientset    *kubernetes.Clientset
+	sysNamespace      string
+	conf              *config.BatchConfig
+	k8sConfig         *rest.Config
+	k8sClient         *k8sclient.K8sClient
+	clientset         *kubernetes.Clientset
+	podUpgradeTimeout time.Duration
 
 	batches         []map[string][]*PodUpgrade
 	lock            sync.Mutex
@@ -173,6 +180,13 @@ type PodUpgrade struct {
 }
 
 func (u *BatchUpgrade) Run(ctx context.Context) {
+	timeout, err := getBatchUpgradeTimeout()
+	if err != nil {
+		logger(fmt.Sprintf("BATCH-FAIL invalid %s: %v", batchUpgradeTimeoutEnv, err))
+		os.Exit(1)
+	}
+	u.podUpgradeTimeout = timeout
+
 	if len(u.conf.Batches) == 0 {
 		logger("BATCH-SUCCESS no batch found")
 		u.status = config.Success
@@ -205,21 +219,31 @@ func (u *BatchUpgrade) Run(ctx context.Context) {
 			u.panic(ctx)
 			return
 		case <-t.C:
-			if u.crtBatchStatus == config.Fail && !u.conf.IgnoreError {
+			if u.getCrtBatchStatus() == config.Fail && !u.conf.IgnoreError {
 				u.status = config.Fail
 				handleFinalStatus()
 				return
 			}
 			if u.crtBatch > len(u.conf.Batches) {
-				u.status = u.crtBatchStatus
+				u.status = u.getCrtBatchStatus()
 				handleFinalStatus()
 				return
 			}
-			switch u.nextBatchStatus {
+			switch u.getNextBatchStatus() {
 			case config.Pending:
-				if u.crtBatchStatus == config.Pending || u.crtBatchStatus == config.Success || (u.crtBatchStatus == config.Fail && u.conf.IgnoreError) {
+				if crtSt := u.getCrtBatchStatus(); crtSt == config.Pending || crtSt == config.Success || (crtSt == config.Fail && u.conf.IgnoreError) {
 					u.crtBatch++
-					go u.processBatch(ctx)
+					if u.crtBatch > len(u.conf.Batches) {
+						// All batches scheduled; final status comes from the last real batch.
+						u.status = u.getCrtBatchStatus()
+						handleFinalStatus()
+						return
+					}
+					// Set Running synchronously so the next ticker tick won't launch
+					// a second concurrent processBatch before this one starts.
+					u.setCrtBatchStatus(config.Running)
+					batchIdx := u.crtBatch
+					go u.processBatch(ctx, batchIdx)
 				}
 			case config.Pause:
 			case config.Stop:
@@ -268,14 +292,10 @@ func (u *BatchUpgrade) fetchPods(ctx context.Context) error {
 	return nil
 }
 
-func (u *BatchUpgrade) processBatch(ctx context.Context) {
-	if u.crtBatch > len(u.conf.Batches) {
-		return
-	}
-	u.setCrtBatchStatus(config.Running)
+func (u *BatchUpgrade) processBatch(ctx context.Context, batchIdx int) {
 	var (
 		wg                  sync.WaitGroup
-		batch               = u.conf.Batches[u.crtBatch-1]
+		batch               = u.conf.Batches[batchIdx-1]
 		crtBatchFinalStatus = config.Success
 		csiNodeNames        = make(map[string][]config.MountPodUpgrade)
 	)
@@ -292,23 +312,35 @@ func (u *BatchUpgrade) processBatch(ctx context.Context) {
 		for csiNode, mps := range csiNodeNames {
 			wg.Add(1)
 
-			go func() {
-				resultCh <- u.triggerUpgrade(ctx, csiNode, batchConfigName, u.crtBatch)
+			go func(csiNode string, mps []config.MountPodUpgrade) {
+				if ok, reason := u.precheckNode(ctx, csiNode); !ok {
+					for _, p := range mps {
+						u.lock.Lock()
+						u.podsStatus[p.Name] = config.Skip
+						u.lock.Unlock()
+						logger(fmt.Sprintf("POD-SKIP [%s] %s", p.Name, reason))
+					}
+					resultCh <- nil
+					wg.Done()
+					return
+				}
+				resultCh <- u.triggerUpgrade(ctx, csiNode, batchConfigName, batchIdx)
 				needWait := false
 				node := ""
 				for _, p := range mps {
 					node = p.Node
-					if u.podsStatus[p.Name] != config.Success && u.podsStatus[p.Name] != config.Fail {
+					st := u.getPodStatus(p.Name)
+					if st != config.Success && st != config.Fail {
 						needWait = true
 						break
 					}
 				}
 				if needWait {
-					u.waitForUpgrade(ctx, u.crtBatch, node, csiNode)
+					u.waitForUpgrade(ctx, batchIdx, node, csiNode)
 				}
 
 				wg.Done()
-			}()
+			}(csiNode, mps)
 		}
 	}()
 	// pod upgrade error:
@@ -319,12 +351,51 @@ func (u *BatchUpgrade) processBatch(ctx context.Context) {
 			crtBatchFinalStatus = config.Fail
 		}
 	}
+	u.lock.Lock()
 	for _, s := range u.podsStatus {
 		if s == config.Fail {
 			crtBatchFinalStatus = config.Fail
 		}
 	}
+	u.lock.Unlock()
 	u.setCrtBatchStatus(crtBatchFinalStatus)
+}
+
+// precheckNode verifies that the node and its CSI node pod are in a state that
+// allows a smooth upgrade. It returns false (with a reason) when the upgrade of
+// all pods on the node should be skipped:
+//  1. the node is marked SchedulingDisabled (spec.unschedulable == true)
+//  2. the CSI node pod on the node is not ready
+//
+// When the node or CSI node pod state cannot be confirmed due to an API error,
+// it conservatively returns false so the node is skipped rather than upgraded.
+func (u *BatchUpgrade) precheckNode(ctx context.Context, csiNode string) (bool, string) {
+	if csiNode == "" {
+		return false, "skip upgrade: no csi node pod found"
+	}
+
+	po, err := u.k8sClient.GetPod(ctx, csiNode, u.sysNamespace)
+	if err != nil {
+		return false, fmt.Sprintf("skip upgrade: can not get csi node pod %s: %s", csiNode, err.Error())
+	}
+	nodeName := po.Spec.NodeName
+	if nodeName == "" {
+		return false, fmt.Sprintf("skip upgrade: csi node pod %s has no node name", csiNode)
+	}
+
+	node, err := u.k8sClient.GetNode(ctx, nodeName)
+	if err != nil {
+		return false, fmt.Sprintf("skip upgrade: can not get node %s: %s", nodeName, err.Error())
+	}
+	if node.Spec.Unschedulable {
+		return false, fmt.Sprintf("skip upgrade: node %s is marked SchedulingDisabled", nodeName)
+	}
+
+	if !resource.IsPodReady(po) {
+		return false, fmt.Sprintf("skip upgrade: csi node pod %s on node %s is not ready", csiNode, nodeName)
+	}
+
+	return true, ""
 }
 
 func (u *BatchUpgrade) setCrtBatchStatus(s config.UpgradeStatus) {
@@ -333,8 +404,28 @@ func (u *BatchUpgrade) setCrtBatchStatus(s config.UpgradeStatus) {
 	u.lock.Unlock()
 }
 
+func (u *BatchUpgrade) getCrtBatchStatus() config.UpgradeStatus {
+	u.lock.Lock()
+	defer u.lock.Unlock()
+	return u.crtBatchStatus
+}
+
 func (u *BatchUpgrade) setNextBatchStatus(s config.UpgradeStatus) {
+	u.lock.Lock()
 	u.nextBatchStatus = s
+	u.lock.Unlock()
+}
+
+func (u *BatchUpgrade) getNextBatchStatus() config.UpgradeStatus {
+	u.lock.Lock()
+	defer u.lock.Unlock()
+	return u.nextBatchStatus
+}
+
+func (u *BatchUpgrade) getPodStatus(name string) config.UpgradeStatus {
+	u.lock.Lock()
+	defer u.lock.Unlock()
+	return u.podsStatus[name]
 }
 
 func (u *BatchUpgrade) panic(ctx context.Context) {
@@ -401,7 +492,7 @@ func (u *BatchUpgrade) triggerUpgrade(ctx context.Context, csiNode string, confi
 }
 
 func (u *BatchUpgrade) waitForUpgrade(ctx context.Context, index int, nodeName, csiNode string) {
-	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, u.podUpgradeTimeout)
 	defer cancel()
 	timer := time.NewTicker(5 * time.Second)
 	defer timer.Stop()
@@ -412,10 +503,10 @@ func (u *BatchUpgrade) waitForUpgrade(ctx context.Context, index int, nodeName, 
 	)
 
 	for _, p := range crtBatch {
-		if u.podsStatus[p.pod.Name] == config.Fail {
+		if u.getPodStatus(p.pod.Name) == config.Fail {
 			failSum[p.pod.Name] = true
 		}
-		if u.podsStatus[p.pod.Name] == config.Success {
+		if u.getPodStatus(p.pod.Name) == config.Success {
 			successSum[p.pod.Name] = true
 		}
 	}
@@ -504,7 +595,7 @@ func (u *BatchUpgrade) waitForUpgrade(ctx context.Context, index int, nodeName, 
 				return
 			}
 			for _, p := range crtBatch {
-				if u.podsStatus[p.pod.Name] != config.Success {
+				if u.getPodStatus(p.pod.Name) != config.Success {
 					u.lock.Lock()
 					u.podsStatus[p.pod.Name] = config.Fail
 					failSum[p.pod.Name] = true
@@ -528,6 +619,22 @@ func (u *BatchUpgrade) waitForUpgrade(ctx context.Context, index int, nodeName, 
 	}
 }
 
+func getBatchUpgradeTimeout() (time.Duration, error) {
+	value := os.Getenv(batchUpgradeTimeoutEnv)
+	if value == "" {
+		return defaultPodUpgradeTimeout, nil
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: must be an integer (seconds), got %q", batchUpgradeTimeoutEnv, value)
+	}
+	timeout := time.Duration(seconds) * time.Second
+	if timeout < minPodUpgradeTimeout {
+		return 0, fmt.Errorf("%s must be at least %v", batchUpgradeTimeoutEnv, minPodUpgradeTimeout)
+	}
+	return timeout, nil
+}
+
 func (u *BatchUpgrade) Write(p []byte) (n int, err error) {
 	msg := string(p)
 	fmt.Print(msg)
@@ -535,9 +642,9 @@ func (u *BatchUpgrade) Write(p []byte) (n int, err error) {
 	runningRegex := `POD-START \[([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)\]`
 	runningRe := regexp.MustCompile(runningRegex)
 
-	runningMatches := runningRe.FindStringSubmatch(msg)
-	if len(runningMatches) > 1 {
-		podName := runningMatches[1]
+	runningMatches := runningRe.FindAllStringSubmatch(msg, -1)
+	for _, match := range runningMatches {
+		podName := match[1]
 		u.lock.Lock()
 		u.podsStatus[podName] = config.Running
 		u.lock.Unlock()
@@ -546,9 +653,9 @@ func (u *BatchUpgrade) Write(p []byte) (n int, err error) {
 	successRegex := `POD-SUCCESS \[([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)\]`
 	successRe := regexp.MustCompile(successRegex)
 
-	successMatches := successRe.FindStringSubmatch(msg)
-	if len(successMatches) > 1 {
-		podName := successMatches[1]
+	successMatches := successRe.FindAllStringSubmatch(msg, -1)
+	for _, match := range successMatches {
+		podName := match[1]
 		u.lock.Lock()
 		u.podsStatus[podName] = config.Success
 		u.lock.Unlock()
@@ -557,11 +664,22 @@ func (u *BatchUpgrade) Write(p []byte) (n int, err error) {
 	failRegex := `POD-FAIL \[([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)\]`
 	failRe := regexp.MustCompile(failRegex)
 
-	failMatches := failRe.FindStringSubmatch(msg)
-	if len(failMatches) > 1 {
-		podName := failMatches[1]
+	failMatches := failRe.FindAllStringSubmatch(msg, -1)
+	for _, match := range failMatches {
+		podName := match[1]
 		u.lock.Lock()
 		u.podsStatus[podName] = config.Fail
+		u.lock.Unlock()
+	}
+
+	skipRegex := `POD-SKIP \[([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)\]`
+	skipRe := regexp.MustCompile(skipRegex)
+
+	skipMatches := skipRe.FindAllStringSubmatch(msg, -1)
+	for _, match := range skipMatches {
+		podName := match[1]
+		u.lock.Lock()
+		u.podsStatus[podName] = config.Skip
 		u.lock.Unlock()
 	}
 

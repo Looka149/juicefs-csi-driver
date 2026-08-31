@@ -2641,6 +2641,166 @@ def test_sidecar_config_with_node_selector():
     return
 
 
+def test_sidecar_config_resource_percentages_with_node_selector():
+    LOG.info("[test case] Sidecar resourcePercentages nodeSelector config begin..")
+    node_selector_key = "jfs-e2e-sidecar-resource-percentages"
+    test_cfg = {
+        "mountPodPatch": [
+            {
+                "nodeSelector": {
+                    "matchLabels": {
+                        node_selector_key: "matched"
+                    }
+                },
+                "resourcePercentages": {
+                    "requests": {
+                        "cpu": "30%",
+                        "memory": "30%"
+                    },
+                    "limits": {
+                        "cpu": "30%",
+                        "memory": "30%"
+                    },
+                    "minLimits": {
+                        "cpu": "800m",
+                        "memory": "128Mi"
+                    }
+                },
+                "mountOptions": [
+                    "buffer-size=50%"
+                ]
+            }
+        ]
+    }
+    update_config(test_cfg)
+    subprocess.check_call(
+        ["kubectl", "annotate", "pods", "--overwrite", "-n", KUBE_SYSTEM, "-l", "app=juicefs-csi-controller",
+         "updatedAt=" + str(int(time.time()))])
+
+    time.sleep(2)
+    app_pvc = PVC(name="pvc-sidecar-resource-percentages-app", access_mode="ReadWriteMany",
+                  storage_name=STORAGECLASS_NAME, pv="")
+    LOG.info("Deploy pvc {}".format(app_pvc.name))
+    app_pvc.create()
+    init_pvc = PVC(name="pvc-sidecar-resource-percentages-init", access_mode="ReadWriteMany",
+                   storage_name=STORAGECLASS_NAME, pv="")
+    LOG.info("Deploy pvc {}".format(init_pvc.name))
+    init_pvc.create()
+
+    for i in range(0, 60):
+        if app_pvc.check_is_bound() and init_pvc.check_is_bound():
+            break
+        time.sleep(1)
+
+    init_container = client.V1Container(
+        name="init-app",
+        image="ubuntu",
+        command=["sh", "-c", "true"],
+        volume_mounts=[client.V1VolumeMount(
+            name="juicefs-init-pv",
+            mount_path="/init-data",
+        )],
+        resources=client.V1ResourceRequirements(
+            requests={
+                "cpu": "1",
+                "memory": "2Gi",
+            },
+            limits={
+                "cpu": "3",
+                "memory": "4Gi",
+            }
+        )
+    )
+    init_volume = client.V1Volume(
+        name="juicefs-init-pv",
+        persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(claim_name=init_pvc.name)
+    )
+    deployment = Deployment(name="app-sidecar-resource-percentages", pvc=app_pvc.name, replicas=1,
+                            node_selector={node_selector_key: "matched"},
+                            resources=client.V1ResourceRequirements(
+                                requests={
+                                    "cpu": "2",
+                                    "memory": "1Gi",
+                                },
+                                limits={
+                                    "cpu": "4",
+                                    "memory": "2Gi",
+                                }
+                            ),
+                            init_containers=[init_container],
+                            additional_volumes=[init_volume])
+    LOG.info("Deploy deployment {}".format(deployment.name))
+    deployment.create()
+
+    pod = None
+    for i in range(0, 60):
+        pods = client.CoreV1Api().list_namespaced_pod(
+            namespace="default",
+            label_selector="deployment={}".format(deployment.name)
+        )
+        if len(pods.items) == 1:
+            pod = pods.items[0]
+            break
+        time.sleep(1)
+    if pod is None:
+        raise Exception("Pod of deployment {} is not created within 1 min.".format(deployment.name))
+
+    mount_containers = {}
+    for container in pod.spec.containers or []:
+        if container.name.startswith("jfs-mount"):
+            mount_containers[container.name] = container
+    for container in pod.spec.init_containers or []:
+        if container.name.startswith("jfs-mount"):
+            mount_containers[container.name] = container
+
+    expected_resources = {
+        "jfs-mount": {
+            "requests": {"cpu": "600m", "memory": "308Mi"},
+            "limits": {"cpu": "1200m", "memory": "615Mi"},
+            "buffer-size": "308",
+        },
+        "jfs-mount-1": {
+            "requests": {"cpu": "300m", "memory": "615Mi"},
+            "limits": {"cpu": "900m", "memory": "1229Mi"},
+            "buffer-size": "615",
+        },
+    }
+    for name, expected in expected_resources.items():
+        mount_container = mount_containers.get(name)
+        if mount_container is None:
+            raise Exception("Pod {} should have {} container".format(pod.metadata.name, name))
+        requests = mount_container.resources.requests or {}
+        limits = mount_container.resources.limits or {}
+        if requests != expected["requests"]:
+            raise Exception("{} requests should be {}, got {}".format(name, expected["requests"], requests))
+        if limits != expected["limits"]:
+            raise Exception("{} limits should be {}, got {}".format(name, expected["limits"], limits))
+        command = " ".join(mount_container.command or [])
+        if "buffer-size={}".format(expected["buffer-size"]) not in command:
+            raise Exception("{} buffer-size should be {}, command: {}".format(
+                name, expected["buffer-size"], command))
+
+    LOG.info("Remove deployment {}".format(deployment.name))
+    deployment.delete()
+    deploy_pod = Pod(name="", deployment_name=deployment.name, replicas=deployment.replicas)
+    LOG.info("Watch for pods of deployment {} for delete.".format(deployment.name))
+    result = deploy_pod.watch_for_delete(deployment.replicas)
+    if not result:
+        raise Exception("Pods of deployment {} are not delete within 5 min.".format(deployment.name))
+    LOG.info("Remove pvc {}".format(app_pvc.name))
+    app_pvc.delete()
+    LOG.info("Remove pvc {}".format(init_pvc.name))
+    init_pvc.delete()
+
+    update_config({})
+    subprocess.check_call(
+        ["kubectl", "annotate", "pods", "--overwrite", "-n", KUBE_SYSTEM, "-l", "app=juicefs-csi-controller",
+         "updatedAt=" + str(int(time.time()))])
+
+    LOG.info("Test pass.")
+    return
+
+
 def test_dynamic_expand():
     if not is_quota_supported():
         LOG.info("juicefs donot support quota, skip.")
@@ -3327,16 +3487,24 @@ def test_secret_has_owner_reference_shared_mount():
     LOG.info("Check secret {} has owner reference..".format(dynamic_secret.secret_name))
     owner_references = dynamic_secret.get_owner_reference()
 
-    if len(owner_references) != 2:
-        raise Exception("Secret {} has {} owner reference, expect 2.".format(dynamic_secret.secret_name, len(owner_references)))
-    owners = [owner.uid for owner in owner_references]
-    # check has each pv uid
-    dynamic_pv_1 = dynamic_pvc_1.get_volume()
-    if dynamic_pv_1.metadata.uid not in owners:
-        raise Exception("Secret {} has no owner reference for pv {}".format(dynamic_secret.secret_name, dynamic_pv_1.metadata.name))
-    dynamic_pv_2 = dynamic_pvc_2.get_volume()
-    if dynamic_pv_2.metadata.uid not in owners:
-        raise Exception("Secret {} has no owner reference for pv {}".format(dynamic_secret.secret_name, dynamic_pv_2.metadata.name))
+    if test_mode == "fs-mount-share":
+        if len(owner_references) != 2:
+            raise Exception("Secret {} has {} owner reference, expect 2.".format(dynamic_secret.secret_name, len(owner_references)))
+        owners = [owner.uid for owner in owner_references]
+        # check has each pv uid
+        dynamic_pv_1 = dynamic_pvc_1.get_volume()
+        if dynamic_pv_1.metadata.uid not in owners:
+            raise Exception("Secret {} has no owner reference for pv {}".format(dynamic_secret.secret_name, dynamic_pv_1.metadata.name))
+        dynamic_pv_2 = dynamic_pvc_2.get_volume()
+        if dynamic_pv_2.metadata.uid not in owners:
+            raise Exception("Secret {} has no owner reference for pv {}".format(dynamic_secret.secret_name, dynamic_pv_2.metadata.name))
+    else:
+        if len(owner_references) != 1:
+            raise Exception("Secret {} has {} owner reference, expect 1.".format(dynamic_secret.secret_name, len(owner_references)))
+        storage_class = client.StorageV1Api().read_storage_class(name=STORAGECLASS_NAME)
+        owner = owner_references[0]
+        if owner.kind != "StorageClass" or owner.uid != storage_class.metadata.uid:
+            raise Exception("Secret {} has no owner reference for storage class {}".format(dynamic_secret.secret_name, STORAGECLASS_NAME))
     
     # delete test resources
     LOG.info("Remove deployment {}".format(deployment.name))
@@ -3365,6 +3533,70 @@ def test_secret_has_owner_reference_shared_mount():
 
     LOG.info("Test pass.")
     return
+
+
+def test_mount_secret_not_updated_when_reused():
+    LOG.info("[test case] mount secret should not be updated when reused begin...")
+
+    test_mode = os.getenv("TEST_MODE")
+    pvc_1 = PVC(name="pvc-mount-secret-resource-version-1", access_mode="ReadWriteMany",
+                storage_name=STORAGECLASS_NAME, pv="")
+    LOG.info("Deploy pvc {}".format(pvc_1.name))
+    pvc_1.create()
+
+    pvcs = [pvc_1]
+    if test_mode == "pod-mount-share":
+        pvc_2 = PVC(name="pvc-mount-secret-resource-version-2", access_mode="ReadWriteMany",
+                    storage_name=STORAGECLASS_NAME, pv="")
+        LOG.info("Deploy pvc {}".format(pvc_2.name))
+        pvc_2.create()
+        pvcs.append(pvc_2)
+
+    for i in range(0, 60):
+        if all(pvc.check_is_bound() for pvc in pvcs):
+            break
+        time.sleep(1)
+
+    pod_1 = Pod(name="app-mount-secret-resource-version-1", deployment_name="", replicas=1,
+                namespace="default", pvc=pvc_1.name)
+    LOG.info("Deploy pod {}".format(pod_1.name))
+    pod_1.create()
+    if not pod_1.watch_for_success():
+        raise Exception("Pod {} is not ready within 10 min.".format(pod_1.name))
+
+    unique_id = pvc_1.get_volume_id()
+    if test_mode == "pod-mount-share":
+        unique_id = STORAGECLASS_NAME
+    secret_name = "juicefs-{}-secret".format(unique_id)
+    secret = client.CoreV1Api().read_namespaced_secret(name=secret_name, namespace=KUBE_SYSTEM)
+    resource_version = secret.metadata.resource_version
+    LOG.info("Secret {} resource version after first mount is {}".format(secret_name, resource_version))
+
+    pod_2 = Pod(name="app-mount-secret-resource-version-2", deployment_name="", replicas=1,
+                namespace="default", pvc=pvcs[-1].name)
+    LOG.info("Deploy pod {}".format(pod_2.name))
+    pod_2.create()
+    if not pod_2.watch_for_success():
+        raise Exception("Pod {} is not ready within 10 min.".format(pod_2.name))
+
+    secret = client.CoreV1Api().read_namespaced_secret(name=secret_name, namespace=KUBE_SYSTEM)
+    if secret.metadata.resource_version != resource_version:
+        raise Exception("Secret {} resource version changed from {} to {} after second mount."
+                        .format(secret_name, resource_version, secret.metadata.resource_version))
+
+    for pod in [pod_2, pod_1]:
+        LOG.info("Remove pod {}".format(pod.name))
+        pod.delete()
+        if not pod.watch_for_delete(1):
+            raise Exception("Pod {} is not deleted within 5 min.".format(pod.name))
+
+    for pvc in reversed(pvcs):
+        LOG.info("Remove pvc {}".format(pvc.name))
+        pvc.delete()
+
+    LOG.info("Test pass.")
+    return
+
 
 def test_set_quota_in_controller():
     if not is_quota_supported():

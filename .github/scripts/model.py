@@ -271,7 +271,8 @@ class PV:
 
 
 class Deployment:
-    def __init__(self, *, name, pvc, replicas, out_put="", pvcs=[], node_selector=None):
+    def __init__(self, *, name, pvc, replicas, out_put="", pvcs=[], node_selector=None, resources=None,
+                 init_containers=None, additional_volumes=None):
         self.name = RESOURCE_PREFIX + name
         self.namespace = "default"
         self.image = "ubuntu"
@@ -283,6 +284,9 @@ class Deployment:
         if pvcs:
             self.pvcs = pvcs
         self.node_selector = node_selector
+        self.resources = resources
+        self.init_containers = init_containers
+        self.additional_volumes = additional_volumes or []
 
     def create(self):
         output = "out.txt"
@@ -302,6 +306,7 @@ class Deployment:
                 persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(claim_name=pvc)
             ))
             date_cmds.append("echo $(date -u) >> /data-{}/{};".format(i, output))
+        volumes.extend(self.additional_volumes)
         date_cmd = " ".join(date_cmds)
         cmd = "while true; do {} sleep 1; done".format(date_cmd)
         container = client.V1Container(
@@ -310,11 +315,13 @@ class Deployment:
             command=["/bin/sh"],
             args=["-c", cmd],
             volume_mounts=volume_mounts,
+            resources=self.resources,
         )
         template = client.V1PodTemplateSpec(
             metadata=client.V1ObjectMeta(labels={"deployment": self.name}),
             spec=client.V1PodSpec(
                 containers=[container],
+                init_containers=self.init_containers,
                 volumes=volumes,
                 node_selector=self.node_selector,
             )

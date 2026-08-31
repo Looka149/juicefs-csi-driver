@@ -269,12 +269,17 @@ func GetTimeAfterDelay(delayStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	delayAt := time.Now().Add(delay)
-	return delayAt.Format("2006-01-02 15:04:05"), nil
+	// RFC3339 in UTC so the timestamp carries its zone and round-trips regardless of local timezone.
+	return time.Now().UTC().Add(delay).Format(time.RFC3339), nil
 }
 
+// GetTime accepts RFC3339 and the legacy zone-less layout, which was written in
+// local time and so must be parsed in local time to avoid a UTC-offset shift.
 func GetTime(str string) (time.Time, error) {
-	return time.Parse("2006-01-02 15:04:05", str)
+	if t, err := time.Parse(time.RFC3339, str); err == nil {
+		return t, nil
+	}
+	return time.ParseInLocation("2006-01-02 15:04:05", str, time.Local)
 }
 
 func QuoteForShell(cmd string) string {
@@ -471,6 +476,25 @@ func NewPrometheus(nodeName string) (prometheus.Registerer, *prometheus.Registry
 	return registerer, registry
 }
 
+func ParsePercentageToFloat(value string) (float64, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasSuffix(value, "%") {
+		return 0, fmt.Errorf("percentage must end with %%")
+	}
+	value = strings.TrimSpace(strings.TrimSuffix(value, "%"))
+	if value == "" {
+		return 0, fmt.Errorf("empty percentage")
+	}
+	percentage, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, err
+	}
+	if percentage < 0 || math.IsInf(percentage, 0) || math.IsNaN(percentage) {
+		return 0, fmt.Errorf("percentage must be a non-negative number")
+	}
+	return percentage, nil
+}
+
 // ParseToBytes parses a string with a unit suffix (e.g. "1M", "2G") to bytes.
 // default unit is M
 func ParseToBytes(value string) (uint64, error) {
@@ -489,6 +513,7 @@ func ParseToBytes(value string) (uint64, error) {
 	}
 	var shift int
 	switch unit {
+	case 'B':
 	case 'k', 'K':
 		shift = 10
 	case 'm', 'M':
@@ -560,12 +585,23 @@ func parseClientVersionFromImage(image string) ClientVersion {
 	if image == "" {
 		return ClientVersion{}
 	}
-	imageSplits := strings.SplitN(image, ":", 2)
+	// Strip digest so "repo:tag@sha256:..." / "repo@sha256:..." are handled correctly.
+	if at := strings.LastIndex(image, "@"); at >= 0 {
+		image = image[:at]
+	}
+	// Tag lives in the last path component. Splitting the whole reference on the first
+	// ":" breaks images whose registry includes a port, e.g.
+	// "registry.example.com:5000/juicedata/mount:ce-v1.2.3".
+	name := image
+	if slash := strings.LastIndex(image, "/"); slash >= 0 {
+		name = image[slash+1:]
+	}
+	imageSplits := strings.SplitN(name, ":", 2)
 	if len(imageSplits) < 2 {
 		// latest
 		return ClientVersion{IsCe: true, Major: math.MaxInt32}
 	}
-	_, tag := imageSplits[0], imageSplits[1]
+	tag := imageSplits[1]
 	version := ClientVersion{Dev: true}
 	var re *regexp.Regexp
 
@@ -670,7 +706,7 @@ func SupportFusePass(pod *corev1.Pod) bool {
 		return true
 	}
 	if v.Dev {
-		return false
+		return true
 	}
 	return supportFusePass(v)
 }
@@ -681,7 +717,7 @@ func ImageSupportBinary(image string) bool {
 		return true
 	}
 	if v.Dev {
-		return false
+		return true
 	}
 	return supportUpgradeBinary(v)
 }
@@ -732,8 +768,10 @@ type JuiceConf struct {
 	Meta struct {
 		Sid uint64
 	}
-	Pid  int
-	PPid int
+	Pid       int
+	PPid      int
+	CommPath  string // e.g. /tmp/fuse_fd_comm.355135
+	StatePath string
 }
 
 func ParseConfig(conf []byte) (*JuiceConf, error) {

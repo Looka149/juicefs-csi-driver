@@ -1,3 +1,6 @@
+//go:build !darwin
+// +build !darwin
+
 /*
 Copyright 2021 Juicedata Inc
 
@@ -199,7 +202,7 @@ func TestGetTimeAfterDelay(t *testing.T) {
 			args: args{
 				delayStr: "1h",
 			},
-			want:    now.Add(1 * time.Hour).Format("2006-01-02 15:04:05"),
+			want:    now.UTC().Add(1 * time.Hour).Format(time.RFC3339),
 			wantErr: false,
 		},
 		{
@@ -226,35 +229,85 @@ func TestGetTimeAfterDelay(t *testing.T) {
 }
 
 func TestGetTime(t *testing.T) {
-	type args struct {
-		str string
-	}
 	tests := []struct {
 		name    string
-		args    args
+		str     string
 		want    time.Time
 		wantErr bool
 	}{
 		{
-			name: "test",
-			args: args{
-				str: "2006-01-02 15:04:05",
-			},
-			want:    time.Date(2006, 1, 2, 15, 4, 5, 0, time.UTC),
-			wantErr: false,
+			name: "rfc3339-utc",
+			str:  "2026-05-29T12:20:38Z",
+			want: time.Date(2026, 5, 29, 12, 20, 38, 0, time.UTC),
+		},
+		{
+			name: "rfc3339-offset",
+			str:  "2026-05-29T20:20:38+08:00",
+			want: time.Date(2026, 5, 29, 12, 20, 38, 0, time.UTC),
+		},
+		{
+			name:    "invalid",
+			str:     "not-a-time",
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetTime(tt.args.str)
+			got, err := GetTime(tt.str)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetTime() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("GetTime() got = %v, want %v", got, tt.want)
+			if tt.wantErr {
+				return
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("GetTime() got = %v, want (same instant) %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// legacy zone-less values were written in local time, so GetTime must parse them in local time.
+func TestGetTimeLegacyFormat(t *testing.T) {
+	orig := time.Local
+	defer func() { time.Local = orig }()
+	time.Local = time.FixedZone("CST", 8*3600) // UTC+8
+
+	got, err := GetTime("2026-05-29 12:20:38")
+	if err != nil {
+		t.Fatalf("GetTime legacy error: %v", err)
+	}
+	wantLocal := time.Date(2026, 5, 29, 12, 20, 38, 0, time.Local) // 12:20:38 CST
+	if !got.Equal(wantLocal) {
+		t.Errorf("legacy value parsed as %v, want %v (parsed in local zone, not UTC)", got, wantLocal)
+	}
+}
+
+// round-trip GetTime(GetTimeAfterDelay(d)) must be ~d regardless of local timezone.
+func TestGetTimeAfterDelayRoundTrip(t *testing.T) {
+	orig := time.Local
+	defer func() { time.Local = orig }()
+
+	for _, tz := range []*time.Location{
+		time.UTC,
+		time.FixedZone("CST", 8*3600),  // UTC+8
+		time.FixedZone("EST", -5*3600), // UTC-5
+	} {
+		time.Local = tz
+		const delay = 3 * time.Hour
+		s, err := GetTimeAfterDelay(delay.String())
+		if err != nil {
+			t.Fatalf("tz=%s GetTimeAfterDelay error: %v", tz, err)
+		}
+		at, err := GetTime(s)
+		if err != nil {
+			t.Fatalf("tz=%s GetTime error: %v", tz, err)
+		}
+		got := time.Until(at)
+		if diff := got - delay; diff < -2*time.Second || diff > 2*time.Second {
+			t.Errorf("tz=%s round-trip delay = %v, want ~%v (off by %v); writer/reader timezone mismatch", tz, got, delay, diff)
+		}
 	}
 }
 
@@ -579,8 +632,18 @@ func TestParseToBytes(t *testing.T) {
 			want: 1 << 30,
 		},
 		{
+			name: "test-has-byte-uint",
+			args: "1048576B",
+			want: 1 << 20,
+		},
+		{
 			name:    "test-invalid",
 			args:    "1d",
+			wantErr: true,
+		},
+		{
+			name:    "test-invalid-lowercase-byte",
+			args:    "1048576b",
 			wantErr: true,
 		},
 	}
@@ -667,6 +730,67 @@ func TestParseClientVersion(t *testing.T) {
 				Nightly: true,
 			},
 		},
+		{
+			name: "ce-with-registry-port",
+			args: args{
+				image: "registry.example.com:5000/juicedata/mount:ce-v1.2.3",
+			},
+			want: ClientVersion{
+				IsCe:  true,
+				Dev:   false,
+				Major: 1,
+				Minor: 2,
+				Patch: 3,
+			},
+		},
+		{
+			name: "ee-with-registry-port",
+			args: args{
+				image: "hub.example.com:8443/kbdp/mount:ee-5.1.0",
+			},
+			want: ClientVersion{
+				IsCe:  false,
+				Dev:   false,
+				Major: 5,
+				Minor: 1,
+				Patch: 0,
+			},
+		},
+		{
+			name: "ce-with-registry-port-and-digest",
+			args: args{
+				image: "registry.example.com:5000/juicedata/mount:ce-v1.2.3@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+			want: ClientVersion{
+				IsCe:  true,
+				Dev:   false,
+				Major: 1,
+				Minor: 2,
+				Patch: 3,
+			},
+		},
+		{
+			name: "ce-latest-with-registry-port",
+			args: args{
+				image: "registry.example.com:5000/juicedata/mount",
+			},
+			want: ClientVersion{
+				IsCe:  true,
+				Dev:   false,
+				Major: math.MaxInt32,
+			},
+		},
+		{
+			name: "dev",
+			args: args{
+				image: "juicedata/mount:2c5ca56",
+			},
+			want: ClientVersion{
+				IsCe:    false,
+				Dev:     true,
+				Nightly: false,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -737,7 +861,7 @@ func TestSupportFusePassPod(t *testing.T) {
 					},
 				},
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "pod with supporting image (ce-v1.2.1)",
@@ -746,6 +870,19 @@ func TestSupportFusePassPod(t *testing.T) {
 					Containers: []corev1.Container{
 						{
 							Image: "juicedata/mount:ce-v1.2.1",
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "pod with supporting image and registry port (ce-v1.2.3)",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Image: "hub.example.com:8443/kbdp/mount:ce-v1.2.3",
 						},
 					},
 				},
@@ -842,6 +979,19 @@ func TestSupportFusePassPod(t *testing.T) {
 				},
 			},
 			want: false,
+		},
+		{
+			name: "pod with no version image",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Image: "juicedata/mount:2c5ca56",
+						},
+					},
+				},
+			},
+			want: true,
 		},
 	}
 

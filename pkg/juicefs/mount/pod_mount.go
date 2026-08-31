@@ -87,9 +87,11 @@ func (p *PodMount) JMount(ctx context.Context, appInfo *jfsConfig.AppInfo, jfsSe
 	var err error
 
 	if err = func() error {
-		lock := jfsConfig.GetPodLock(hashVal)
-		lock.Lock()
-		defer lock.Unlock()
+		unlock, err := jfsConfig.LockPod(ctx, hashVal)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 
 		podName, err = p.genMountPodName(ctx, jfsSetting)
 		if err != nil {
@@ -243,18 +245,30 @@ func (p *PodMount) UmountTarget(ctx context.Context, target, podName string) err
 	// targetPath may be mount bind many times when mount point recovered.
 	// umount until it's not mounted.
 	log := util.GenLog(ctx, p.log, "UmountTarget")
-	log.Info("lazy umount", "target", target)
+	enableLazyUmountTarget := jfsConfig.GlobalConfig.EnableLazyUmountTarget == nil || *jfsConfig.GlobalConfig.EnableLazyUmountTarget
+	log.Info("umount target", "target", target, "lazy", enableLazyUmountTarget)
 	for {
-		command := exec.Command("umount", "-l", target)
+		args := []string{target}
+		if enableLazyUmountTarget {
+			args = []string{"-l", target}
+		}
+		command := exec.CommandContext(ctx, "umount", args...)
 		out, err := command.CombinedOutput()
 		if err == nil {
 			continue
 		}
-		log.V(1).Info(string(out))
-		if !strings.Contains(string(out), "not mounted") &&
-			!strings.Contains(string(out), "mountpoint not found") &&
-			!strings.Contains(string(out), "no mount point specified") {
-			log.Error(err, "Could not lazy unmount", "target", target, "out", string(out))
+		outStr := string(out)
+		log.V(1).Info(outStr)
+		if !enableLazyUmountTarget && strings.Contains(outStr, "busy") {
+			if err := util.UmountPath(ctx, target, true); err != nil {
+				return err
+			}
+			continue
+		}
+		if !strings.Contains(outStr, "not mounted") &&
+			!strings.Contains(outStr, "mountpoint not found") &&
+			!strings.Contains(outStr, "no mount point specified") {
+			log.Error(err, "Could not unmount", "target", target, "lazy", enableLazyUmountTarget, "out", outStr)
 			return err
 		}
 		break
@@ -300,10 +314,13 @@ func (p *PodMount) JUmount(ctx context.Context, target, podName string) error {
 		}
 		if !shouldDelay {
 			// close socket
+			sourcePath, _, err := util.GetMountPathOfPod(*po)
+			if err == nil {
+				util.SaveFuseDevMinor(po.Name, sourcePath)
+			}
 			if config.SupportFusePass(po) {
 				passfd.GlobalFds.StopFd(ctx, po)
 			}
-			sourcePath, _, err := util.GetMountPathOfPod(*po)
 			if err == nil {
 				_ = util.DoWithTimeout(ctx, defaultCheckTimeout, func(ctx context.Context) error {
 					return util.UmountPath(ctx, sourcePath, true)
@@ -383,7 +400,11 @@ func (p *PodMount) JDeleteVolume(ctx context.Context, jfsSetting *jfsConfig.JfsS
 		return err
 	}
 	secret := r.NewSecret()
-	builder.SetJobAsOwner(&secret, *exist)
+	if jfsSetting.SC != nil {
+		builder.SetStorageClassAsOwner(&secret, jfsSetting.SC)
+	} else {
+		builder.SetJobAsOwner(&secret, *exist)
+	}
 	if err := resource.CreateOrUpdateSecret(ctx, p.K8sClient, &secret); err != nil {
 		return err
 	}
@@ -452,7 +473,11 @@ func (p *PodMount) createOrAddRef(ctx context.Context, podName string, jfsSettin
 
 	r := builder.NewPodBuilder(jfsSetting, 0)
 	secret := r.NewSecret()
-	builder.SetPVAsOwner(&secret, jfsSetting.PV)
+	if jfsSetting.SC != nil {
+		builder.SetStorageClassAsOwner(&secret, jfsSetting.SC)
+	} else {
+		builder.SetPVAsOwner(&secret, jfsSetting.PV)
+	}
 	key := util.GetReferenceKey(jfsSetting.TargetPath)
 
 	waitCtx, waitCancel := context.WithTimeout(ctx, 60*time.Second)

@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/klog/v2"
@@ -95,12 +97,20 @@ type JfsSetting struct {
 	PV   *corev1.PersistentVolume      `json:"-"`
 	PVC  *corev1.PersistentVolumeClaim `json:"-"`
 	Node *corev1.Node                  `json:"-"`
+	SC   *storagev1.StorageClass       `json:"-"`
 
-	MountShareMode string `json:"-"`
+	AppPod         *corev1.Pod `json:"-"`
+	MountShareMode string      `json:"-"`
 }
 
 func (s *JfsSetting) String() string {
-	data, _ := json.Marshal(s)
+	setting := *s
+	setting.MountPath = filepath.Join(PodMountBase, setting.UniqueId)
+	if setting.MountShareMode != "" {
+		setting.VolumeId = setting.UniqueId
+		setting.SubPath = ""
+	}
+	data, _ := json.Marshal(&setting)
 	return string(data)
 }
 
@@ -147,6 +157,7 @@ func (s *JfsSetting) Safe(withCompare *JfsSetting) *JfsSetting {
 	sCopy.VolumeId = ""
 	sCopy.SubPath = ""
 	sCopy.InitConfig = ""
+	sCopy.MountPath = ""
 	return sCopy
 }
 
@@ -172,6 +183,7 @@ type PodAttr struct {
 
 	Resources corev1.ResourceRequirements
 
+	ImagePullPolicy               corev1.PullPolicy     `json:"imagePullPolicy,omitempty"`
 	Labels                        map[string]string     `json:"labels,omitempty"`
 	Annotations                   map[string]string     `json:"annotations,omitempty"`
 	LivenessProbe                 *corev1.Probe         `json:"livenessProbe,omitempty"`
@@ -1146,13 +1158,33 @@ func getDefaultResource() corev1.ResourceRequirements {
 
 func processOption(option string, resources corev1.ResourceRequirements) string {
 	pair := strings.Split(option, "=")
-	if len(pair) != 2 || pair[0] != "buffer-size" {
+	if len(pair) != 2 || strings.TrimSpace(pair[0]) != "buffer-size" {
 		return option
 	}
+	pair[0], pair[1] = strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
 	memLimit := resources.Limits[corev1.ResourceMemory]
 	memLimitByte := memLimit.Value()
 	if memLimitByte <= 0 {
+		if strings.HasSuffix(pair[1], "%") {
+			return ""
+		}
 		return option
+	}
+
+	if strings.HasSuffix(strings.TrimSpace(pair[1]), "%") {
+		percentage, err := util.ParsePercentageToFloat(pair[1])
+		if err != nil {
+			log.Error(err, "parse buffer-size error, ignore buffer-size option", "buffer-size", pair[1])
+			return ""
+		}
+		const mib = int64(1024 * 1024)
+		if percentage > 100 {
+			percentage = 100
+			log.Info("buffer-size is greater than pod memory limit, fallback to memory limit", "buffer-size", pair[1], "memory limit", strconv.FormatInt(memLimitByte, 10))
+		}
+		bufferSize := int64(math.Ceil(float64(memLimitByte) * percentage / 100))
+		pair[1] = strconv.FormatInt((bufferSize+mib-1)/mib, 10)
+		return strings.Join(pair, "=")
 	}
 
 	bufferSize, err := util.ParseToBytes(pair[1])
@@ -1170,12 +1202,131 @@ func processOption(option string, resources corev1.ResourceRequirements) string 
 	return option
 }
 
+func getAppContainerResources(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) corev1.ResourceRequirements {
+	volumeNames := map[string]bool{}
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvc.Name {
+			volumeNames[volume.Name] = true
+		}
+	}
+
+	requests := corev1.ResourceList{}
+	limits := corev1.ResourceList{}
+	containers := make([]corev1.Container, 0, len(pod.Spec.Containers)+len(pod.Spec.InitContainers))
+	containers = append(containers, pod.Spec.Containers...)
+	containers = append(containers, pod.Spec.InitContainers...)
+	for _, container := range containers {
+		mounted := false
+		for _, mount := range container.VolumeMounts {
+			if volumeNames[mount.Name] {
+				mounted = true
+				break
+			}
+		}
+		if !mounted {
+			continue
+		}
+		if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
+			sum := requests[corev1.ResourceCPU]
+			sum.Add(cpu)
+			requests[corev1.ResourceCPU] = sum
+		}
+		if memory, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
+			sum := requests[corev1.ResourceMemory]
+			sum.Add(memory)
+			requests[corev1.ResourceMemory] = sum
+		}
+		if cpu, ok := container.Resources.Limits[corev1.ResourceCPU]; ok {
+			sum := limits[corev1.ResourceCPU]
+			sum.Add(cpu)
+			limits[corev1.ResourceCPU] = sum
+		}
+		if memory, ok := container.Resources.Limits[corev1.ResourceMemory]; ok {
+			sum := limits[corev1.ResourceMemory]
+			sum.Add(memory)
+			limits[corev1.ResourceMemory] = sum
+		}
+	}
+	return corev1.ResourceRequirements{
+		Requests: requests,
+		Limits:   limits,
+	}
+}
+
+func applyResourcePercentages(resources *corev1.ResourceList, percentages ResourcePercentageList, minimums corev1.ResourceList, appRequests corev1.ResourceList) {
+	if len(percentages) == 0 {
+		return
+	}
+	if *resources == nil {
+		*resources = corev1.ResourceList{}
+	}
+	for name, percentageValue := range percentages {
+		request, ok := appRequests[name]
+		if !ok {
+			continue
+		}
+		if name != corev1.ResourceCPU && name != corev1.ResourceMemory {
+			log.Error(fmt.Errorf("resourcePercentages only supports cpu and memory"), "invalid resource percentage", "resource", name, "value", percentageValue)
+			continue
+		}
+		percentage, err := util.ParsePercentageToFloat(percentageValue)
+		if err != nil {
+			log.Error(err, "invalid resource percentage", "resource", name, "value", percentageValue)
+			continue
+		}
+		quantity := calculateResourcePercentage(name, request, percentage)
+		if minimum, ok := minimums[name]; ok && quantity.Cmp(minimum) < 0 {
+			quantity = minimum
+		}
+		(*resources)[name] = quantity
+	}
+}
+
+func calculateResourcePercentage(name corev1.ResourceName, base resource.Quantity, percentage float64) resource.Quantity {
+	if name == corev1.ResourceCPU {
+		milliValue := int64(math.Ceil(float64(base.MilliValue()) * percentage / 100))
+		return *resource.NewMilliQuantity(milliValue, resource.DecimalSI)
+	}
+	value := int64(math.Ceil(float64(base.Value()) * percentage / 100))
+	if value > 0 {
+		const mib = int64(1024 * 1024)
+		value = (value + mib - 1) / mib * mib
+	}
+	return *resource.NewQuantity(value, resource.BinarySI)
+}
+
+func applyPatchResourcePercentages(setting *JfsSetting, patch MountPodPatch, appResources corev1.ResourceRequirements) {
+	if patch.ResourcePercentages == nil {
+		return
+	}
+	if setting.AppPod == nil || setting.PVC == nil {
+		return
+	}
+	minLimits := corev1.ResourceList{
+		// TODO: change me
+		corev1.ResourceCPU:    resource.MustParse("100m"),
+		corev1.ResourceMemory: resource.MustParse("300Mi"),
+	}
+	for name, quantity := range patch.ResourcePercentages.MinLimits {
+		minLimits[name] = quantity
+	}
+	applyResourcePercentages(&setting.Attr.Resources.Requests, patch.ResourcePercentages.Requests, nil, appResources.Requests)
+	applyResourcePercentages(&setting.Attr.Resources.Limits, patch.ResourcePercentages.Limits, minLimits, appResources.Limits)
+}
+
 func applyConfigPatch(setting *JfsSetting, replaceTemplate bool) {
 	attr := setting.Attr
 	// overwrite by mountpod patch
 	patch := GlobalConfig.GenMountPodPatch(*setting, replaceTemplate, setting.Node)
+	appResources := corev1.ResourceRequirements{}
+	if setting.AppPod != nil && setting.PVC != nil {
+		appResources = getAppContainerResources(setting.AppPod, setting.PVC)
+	}
 	if patch.Image != "" {
 		attr.Image = patch.Image
+	}
+	if patch.ImagePullPolicy != "" {
+		attr.ImagePullPolicy = patch.ImagePullPolicy
 	}
 	if patch.HostNetwork != nil {
 		attr.HostNetwork = *patch.HostNetwork
@@ -1198,6 +1349,7 @@ func applyConfigPatch(setting *JfsSetting, replaceTemplate bool) {
 	if patch.Resources != nil {
 		attr.Resources = *patch.Resources
 	}
+	applyPatchResourcePercentages(setting, patch, appResources)
 	if patch.HostnameKey != "" {
 		attr.HostnameKey = patch.HostnameKey
 	}
@@ -1217,14 +1369,14 @@ func applyConfigPatch(setting *JfsSetting, replaceTemplate bool) {
 	patchOptionsMap := make(map[string]bool)
 	for _, option := range patch.MountOptions {
 		pair := strings.Split(option, "=")
-		patchOptionsMap[pair[0]] = true
+		patchOptionsMap[strings.TrimSpace(pair[0])] = true
 		if v := processOption(option, setting.Attr.Resources); v != "" {
 			newOptions = append(newOptions, v)
 		}
 	}
 	for _, option := range setting.Options {
 		pair := strings.Split(option, "=")
-		if _, ok := patchOptionsMap[pair[0]]; !ok {
+		if _, ok := patchOptionsMap[strings.TrimSpace(pair[0])]; !ok {
 			if v := processOption(option, setting.Attr.Resources); v != "" {
 				newOptions = append(newOptions, v)
 			}
